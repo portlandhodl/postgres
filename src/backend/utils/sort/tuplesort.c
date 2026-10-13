@@ -1210,6 +1210,74 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 	MemoryContextSwitchTo(oldcontext);
 }
 
+/*
+ * tuplesort_bounded_reject
+ *
+ * Check whether a new input tuple whose leading sort key is datum1/isnull1
+ * can be discarded from a bounded sort immediately, i.e. before the caller
+ * has spent any effort copying the tuple into sort storage.
+ *
+ * This is possible only while the sort has already converted its state into
+ * a bounded heap (TSS_BOUNDED); from that point on, tuplesort's contract
+ * compares each incoming tuple against the current top of the heap and
+ * discards it when the comparison says the new tuple is not within the
+ * bound.  Replicating that leading-key comparison is authoritative here
+ * because abbreviated keys are disabled for bounded sorts (see
+ * tuplesort_set_bound), so the datum1 stored in each SortTuple is the
+ * genuine first key value.  A nonzero result of the leading-key comparison
+ * is final: comparator routines only examine the remaining sort keys (or,
+ * with abbreviation, the tuple proper) when the leading keys compare equal,
+ * and comparisons involving NULLs are resolved by the NULLS FIRST/LAST
+ * rules within ApplySortComparator without ever looking at the tuple.  When
+ * the leading keys compare equal, the final result depends on the rest of
+ * the tuple, so we decline to decide.
+ *
+ * Returns true if the tuple can be safely discarded; false if the check
+ * does not apply or cannot decide the outcome, in which case the caller
+ * must proceed with the regular full-tuple path.
+ */
+bool
+tuplesort_bounded_reject(Tuplesortstate *state, Datum datum1, bool isnull1)
+{
+	SortSupport sortKey = state->base.sortKeys;
+	int32		compare;
+
+	/* Only possible once a bounded heap has been materialized */
+	if (state->status != TSS_BOUNDED)
+		return false;
+
+	/*
+	 * Defensively verify that abbreviated keys are not in use.  Bounded
+	 * sorts are not an effective target for abbreviation and
+	 * tuplesort_set_bound() disables it, but datum1 is not authoritative
+	 * otherwise.
+	 */
+	if (sortKey->abbrev_converter != NULL)
+		return false;
+
+	/*
+	 * Perform the same leading-key comparison that COMPARETUP would do
+	 * against the top of the bounded heap.  Note that the sort direction
+	 * was reversed when the heap was built, so a new tuple that compares
+	 * less than or equal to the top is the one to be discarded, mirroring
+	 * the check in tuplesort_puttuple_common()'s TSS_BOUNDED branch.  An
+	 * equal result requires comparing the remaining keys, and possibly the
+	 * rest of the tuple, so only a strict result can reject here; ties fall
+	 * through to the regular path.
+	 */
+	compare = ApplySortComparator(datum1, isnull1,
+								  state->memtuples[0].datum1,
+								  state->memtuples[0].isnull1,
+								  sortKey);
+	if (compare < 0)
+	{
+		CHECK_FOR_INTERRUPTS();
+		return true;
+	}
+
+	return false;
+}
+
 static bool
 consider_abort_common(Tuplesortstate *state)
 {

@@ -347,6 +347,8 @@ extern bool tuplesort_used_bound(Tuplesortstate *state);
 extern void tuplesort_puttuple_common(Tuplesortstate *state,
 									  SortTuple *tuple, bool useAbbrev,
 									  Size tuplen);
+extern bool tuplesort_bounded_reject(Tuplesortstate *state,
+									 Datum datum1, bool isnull1);
 extern void tuplesort_performsort(Tuplesortstate *state);
 extern bool tuplesort_gettuple_common(Tuplesortstate *state, bool forward,
 									  SortTuple *stup);

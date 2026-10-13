@@ -748,12 +748,34 @@ void
 tuplesort_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
-	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
+	MemoryContext oldcontext;
 	TupleDesc	tupDesc = (TupleDesc) base->arg;
 	SortTuple	stup;
 	MinimalTuple tuple;
 	HeapTupleData htup;
 	Size		tuplen;
+
+	/*
+	 * In a bounded sort (ORDER BY key ... LIMIT N), most input tuples can
+	 * be discarded based on their leading sort key alone once the bounded
+	 * heap is established.  Extracting that key from the caller's slot is
+	 * far cheaper than copying the whole tuple into sort storage, so try
+	 * to reject the tuple before copying.  Abbreviated keys are disabled
+	 * in bounded sorts (see tuplesort_set_bound), so the extracted key is
+	 * directly comparable with the heap's top entry.  Ties and tuples that
+	 * must displace the heap's top go through the regular copy path below.
+	 */
+	if (base->sortopt & TUPLESORT_ALLOWBOUNDED)
+	{
+		bool		isnull1;
+		Datum		datum1;
+
+		datum1 = slot_getattr(slot, base->sortKeys[0].ssup_attno, &isnull1);
+		if (tuplesort_bounded_reject(state, datum1, isnull1))
+			return;
+	}
+
+	oldcontext = MemoryContextSwitchTo(base->tuplecontext);
 
 	/* copy the tuple into sort storage */
 	tuple = ExecCopySlotMinimalTuple(slot);
@@ -936,10 +958,21 @@ void
 tuplesort_putdatum(Tuplesortstate *state, Datum val, bool isNull)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
-	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
+	MemoryContext oldcontext;
 	TuplesortDatumArg *arg = (TuplesortDatumArg *) base->arg;
 	SortTuple	stup;
 	Size		tuplen;
+
+	/*
+	 * As in tuplesort_puttupleslot, bounded sorts can reject most input
+	 * using the leading (and only) sort key alone, so try that before
+	 * copying the value into sort storage.
+	 */
+	if ((base->sortopt & TUPLESORT_ALLOWBOUNDED) &&
+		tuplesort_bounded_reject(state, val, isNull))
+		return;
+
+	oldcontext = MemoryContextSwitchTo(base->tuplecontext);
 
 	/*
 	 * Pass-by-value types or null values are just stored directly in
