@@ -5391,9 +5391,16 @@ AM                    | btree
 Operator family       | time_ops
 Registered left type  | time without time zone
 Registered right type | time without time zone
+Number                | 2
+Function              | time_sortsupport(internal)
+-[ RECORD 3 ]---------+---------------------------------------------------------------------------------
+AM                    | btree
+Operator family       | time_ops
+Registered left type  | time without time zone
+Registered right type | time without time zone
 Number                | 4
 Function              | btequalimage(oid)
--[ RECORD 3 ]---------+---------------------------------------------------------------------------------
+-[ RECORD 4 ]---------+---------------------------------------------------------------------------------
 AM                    | btree
 Operator family       | time_ops
 Registered left type  | time without time zone

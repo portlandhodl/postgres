@@ -33,6 +33,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/sortsupport.h"
 #include "utils/varlena.h"
 
 
@@ -231,6 +232,32 @@ bttidcmp(PG_FUNCTION_ARGS)
 	ItemPointer arg2 = PG_GETARG_ITEMPOINTER(1);
 
 	PG_RETURN_INT32(ItemPointerCompare(arg1, arg2));
+}
+
+/*
+ * SortSupport "traditional" comparison function.  Pulls out the two
+ * ItemPointer structs and runs the standard comparison on them.
+ */
+static int
+tid_fast_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	ItemPointer arg1 = DatumGetItemPointer(x);
+	ItemPointer arg2 = DatumGetItemPointer(y);
+
+	return ItemPointerCompare(arg1, arg2);
+}
+
+/*
+ * Sort support routine.  ItemPointers are passed by reference, so we just
+ * supply a comparator that bypasses the fmgr overhead.
+ */
+Datum
+bttidsortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = tid_fast_cmp;
+	PG_RETURN_VOID();
 }
 
 Datum

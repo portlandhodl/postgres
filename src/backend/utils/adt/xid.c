@@ -23,6 +23,7 @@
 #include "common/int.h"
 #include "libpq/pqformat.h"
 #include "utils/builtins.h"
+#include "utils/sortsupport.h"
 #include "utils/xid8.h"
 
 #define PG_GETARG_COMMANDID(n)		DatumGetCommandId(PG_GETARG_DATUM(n))
@@ -298,6 +299,20 @@ xid8cmp(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(0);
 	else
 		PG_RETURN_INT32(-1);
+}
+
+/*
+ * Sort support routine.  FullTransactionId is a pass-by-value uint64 datum
+ * with no wraparound semantics, so a plain unsigned 64-bit comparison is
+ * order-preserving.
+ */
+Datum
+xid8sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_uint64_cmp;
+	PG_RETURN_VOID();
 }
 
 Datum

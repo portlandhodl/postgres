@@ -24,8 +24,10 @@
 #include "common/hashfn.h"
 #include "libpq/pqformat.h"
 #include "nodes/nodes.h"
+#include "port/pg_bswap.h"
 #include "utils/fmgrprotos.h"
 #include "utils/inet.h"
+#include "utils/sortsupport.h"
 
 /*
  *	Utility macros used for sorting and comparing:
@@ -37,6 +39,10 @@
   ((unsigned long)(((addr)->e<<24) | ((addr)->f<<16) | ((addr)->g<<8) | ((addr)->h)))
 
 static unsigned char hex2_to_uchar(const unsigned char *ptr, bool *badhex);
+
+static int	macaddr8_fast_cmp(Datum x, Datum y, SortSupport ssup);
+static bool macaddr8_abbrev_abort(int memtupcount, SortSupport ssup);
+static Datum macaddr8_abbrev_convert(Datum original, SortSupport ssup);
 
 static const signed char hexlookup[128] = {
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -386,6 +392,88 @@ macaddr8_ne(PG_FUNCTION_ARGS)
 	macaddr8   *a2 = PG_GETARG_MACADDR8_P(1);
 
 	PG_RETURN_BOOL(macaddr8_cmp_internal(a1, a2) != 0);
+}
+
+/*
+ * SortSupport strategy function. Populates a SortSupport struct with the
+ * information necessary to use comparison by abbreviated keys.
+ */
+Datum
+macaddr8_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = macaddr8_fast_cmp;
+	ssup->ssup_extra = NULL;
+
+	if (ssup->abbreviate)
+	{
+		ssup->comparator = ssup_datum_uint64_cmp;
+		ssup->abbrev_converter = macaddr8_abbrev_convert;
+		ssup->abbrev_abort = macaddr8_abbrev_abort;
+		ssup->abbrev_full_comparator = macaddr8_fast_cmp;
+	}
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * SortSupport "traditional" comparison function. Pulls two MAC addresses
+ * from the heap and runs a standard comparison on them.
+ */
+static int
+macaddr8_fast_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	macaddr8   *arg1 = DatumGetMacaddr8P(x);
+	macaddr8   *arg2 = DatumGetMacaddr8P(y);
+
+	return macaddr8_cmp_internal(arg1, arg2);
+}
+
+/*
+ * Abbreviation is never aborted for macaddr8 because the 8-byte MAC address
+ * fits entirely within a 64-bit Datum, making the abbreviated key
+ * authoritative.
+ */
+static bool
+macaddr8_abbrev_abort(int memtupcount, SortSupport ssup)
+{
+	return false;
+}
+
+/*
+ * SortSupport conversion routine. Converts original macaddr8 representation
+ * to abbreviated key representation.
+ *
+ * Packs the bytes of an 8-byte MAC address into a Datum and treats it as an
+ * unsigned integer for purposes of comparison. The integer is converted to
+ * native endianness to facilitate easy comparison.
+ */
+static Datum
+macaddr8_abbrev_convert(Datum original, SortSupport ssup)
+{
+	macaddr8   *authoritative = DatumGetMacaddr8P(original);
+	Datum		res;
+
+	/*
+	 * memcpy() the 8 bytes of the MAC address into the Datum; the macaddr8
+	 * struct has no padding.
+	 */
+	StaticAssertDecl(sizeof(res) >= sizeof(macaddr8),
+					 "Datum is too small for macaddr8");
+	memcpy(&res, authoritative, sizeof(macaddr8));
+
+	/*
+	 * Byteswap on little-endian machines.
+	 *
+	 * This is needed so that ssup_datum_uint64_cmp() (an unsigned integer
+	 * 3-way comparator) works correctly on all platforms. Without this, the
+	 * comparator would have to call memcmp() with a pair of pointers to the
+	 * first byte of each abbreviated key, which is slower.
+	 */
+	res = DatumBigEndianToNative(res);
+
+	return res;
 }
 
 /*

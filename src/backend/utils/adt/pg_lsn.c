@@ -18,6 +18,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/numeric.h"
 #include "utils/pg_lsn.h"
+#include "utils/sortsupport.h"
 
 #define MAXPG_LSNLEN			17
 
@@ -176,6 +177,19 @@ pg_lsn_cmp(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(0);
 	else
 		PG_RETURN_INT32(-1);
+}
+
+/*
+ * Sort support routine.  XLogRecPtr is a pass-by-value uint64 datum, so a
+ * plain unsigned 64-bit comparison is order-preserving.
+ */
+Datum
+pg_lsn_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_uint64_cmp;
+	PG_RETURN_VOID();
 }
 
 /* hash index opclass support */

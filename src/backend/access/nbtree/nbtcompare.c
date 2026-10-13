@@ -80,6 +80,15 @@ btboolcmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) a - (int32) b);
 }
 
+Datum
+btboolsortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_int32_cmp;
+	PG_RETURN_VOID();
+}
+
 static Datum
 bool_decrement(Relation rel, Datum existing, bool *underflow)
 {
@@ -579,6 +588,22 @@ btcharcmp(PG_FUNCTION_ARGS)
 
 	/* Be careful to compare chars as unsigned */
 	PG_RETURN_INT32((int32) ((uint8) a) - (int32) ((uint8) b));
+}
+
+Datum
+btcharsortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	/*
+	 * btcharcmp compares chars as unsigned.  A "char" Datum is built with
+	 * CharGetDatum, so on platforms where char is signed the upper bits are
+	 * sign-extended.  That sign extension preserves unsigned byte order when
+	 * the datum is read as a uint32, so ssup_datum_uint32_cmp is consistent
+	 * with btcharcmp on all platforms.
+	 */
+	ssup->comparator = ssup_datum_uint32_cmp;
+	PG_RETURN_VOID();
 }
 
 static Datum

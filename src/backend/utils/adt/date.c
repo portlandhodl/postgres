@@ -1851,6 +1851,19 @@ time_cmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(0);
 }
 
+/*
+ * Sort support routine.  TimeADT is a pass-by-value signed int64 datum, so
+ * a plain signed 64-bit comparison is order-preserving.
+ */
+Datum
+time_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_int64_cmp;
+	PG_RETURN_VOID();
+}
+
 Datum
 time_hash(PG_FUNCTION_ARGS)
 {
@@ -2648,6 +2661,33 @@ timetz_cmp(PG_FUNCTION_ARGS)
 	TimeTzADT  *time2 = PG_GETARG_TIMETZADT_P(1);
 
 	PG_RETURN_INT32(timetz_cmp_internal(time1, time2));
+}
+
+/*
+ * SortSupport "traditional" comparison function.  Pulls out the two
+ * TimeTzADT structs and runs the standard comparison on them.
+ */
+static int
+timetz_fast_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	TimeTzADT  *time1 = DatumGetTimeTzADTP(x);
+	TimeTzADT  *time2 = DatumGetTimeTzADTP(y);
+
+	return timetz_cmp_internal(time1, time2);
+}
+
+/*
+ * Sort support routine.  TimeTzADT is a pass-by-reference struct that is
+ * too wide to abbreviate into a Datum, so we just supply a comparator that
+ * bypasses the fmgr overhead.
+ */
+Datum
+timetz_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = timetz_fast_cmp;
+	PG_RETURN_VOID();
 }
 
 Datum

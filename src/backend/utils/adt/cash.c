@@ -30,6 +30,7 @@
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/pg_locale.h"
+#include "utils/sortsupport.h"
 
 
 /*************************************************************************
@@ -700,6 +701,19 @@ cash_cmp(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(0);
 	else
 		PG_RETURN_INT32(-1);
+}
+
+/*
+ * Sort support routine.  Cash is a pass-by-value signed int64 datum, so a
+ * plain signed 64-bit comparison is order-preserving.
+ */
+Datum
+cash_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_int64_cmp;
+	PG_RETURN_VOID();
 }
 
 
