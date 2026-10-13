@@ -300,6 +300,13 @@ BuildTupleHashTable(PlanState *parent,
 void
 ResetTupleHashTable(TupleHashTable hashtable)
 {
+	/*
+	 * Clear the tableslot before releasing the entry tuples.  Otherwise it
+	 * would be left referencing a dangling MinimalTuple, which could confuse
+	 * TupleHashTableMatch's check whether the slot still holds the same
+	 * entry (a new entry might end up at the same address).
+	 */
+	ExecClearTuple(hashtable->tableslot);
 	tuplehash_reset(hashtable->hashtab);
 	MemoryContextReset(hashtable->tuplescxt);
 }
@@ -612,7 +619,31 @@ TupleHashTableMatch(struct tuplehash_hash *tb, MinimalTuple tuple1, MinimalTuple
 	 */
 	Assert(tuple1 != NULL);
 	slot1 = hashtable->tableslot;
-	ExecStoreMinimalTuple(tuple1, slot1, false);
+
+	/*
+	 * Skip re-storing the entry tuple if the slot already holds exactly this
+	 * entry from a previous match.  ExecStoreMinimalTuple() clears the slot,
+	 * so it would discard the already-deformed attribute values, forcing the
+	 * equality expression to deform the same tuple from scratch.  That is a
+	 * significant cost when many consecutive input rows belong to the same
+	 * group, a common pattern in hashed aggregation.
+	 *
+	 * Skipping the store is safe here: table entry tuples are never modified
+	 * (so any values already extracted from the slot are still correct), and
+	 * slot_getsomeattrs() doesn't copy data out of such tuples (extracted
+	 * pass-by-reference values point into the tuple itself), so they cannot
+	 * be invalidated by resets of the callers' short-lived contexts done
+	 * between probes.  The only event that frees entry tuples is the
+	 * ResetTupleHashTable() call, and that clears the slot, preventing a
+	 * coincidental address match with a later entry.
+	 *
+	 * The tableslot is always created as a TTSOpsMinimalTuple slot by
+	 * BuildTupleHashTable().
+	 */
+	Assert(slot1->tts_ops == &TTSOpsMinimalTuple);
+	if (TTS_EMPTY(slot1) ||
+		((MinimalTupleTableSlot *) slot1)->mintuple != tuple1)
+		ExecStoreMinimalTuple(tuple1, slot1, false);
 	Assert(tuple2 == NULL);
 	slot2 = hashtable->inputslot;
 
