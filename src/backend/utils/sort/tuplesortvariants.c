@@ -177,6 +177,60 @@ typedef struct BrinSortTuple
 #define BRINSORTTUPLE_SIZE(len)		(offsetof(BrinSortTuple, tuple) + (len))
 
 
+/*
+ * Per-tuple sort key cache for the heap (MinimalTuple) sort variant.
+ *
+ * For multi-key sorts, a cache of the extracted values of the second and
+ * later sort keys is stored immediately preceding each stored MinimalTuple,
+ * within the same allocation (TuplesortPublic.tupleheadroom tracks the size
+ * of this area, or is zero when no cache is maintained).  The cache is
+ * structured as an array of nKeys - 1 Datums followed by an array of
+ * nKeys - 1 bools for the corresponding null flags.  The first key's value
+ * is not included, as it's already stored in SortTuple.datum1.
+ *
+ * Extracting the additional sort keys once per input tuple is much cheaper
+ * than extracting them with heap_getattr() during every tiebreak
+ * comparison, which is the dominant cost of multi-key sorts whenever the
+ * leading key has many duplicate values.
+ */
+
+/* Compute the size of the per-tuple sort key cache */
+static inline Size
+heap_sortkeycache_size(int nkeys)
+{
+	return MAXALIGN((nkeys - 1) * sizeof(Datum) + (nkeys - 1) * sizeof(bool));
+}
+
+/* Accessors for the cached datums and null flags, given a stored tuple */
+#define HEAP_SORTKEYCACHE_DATUMS(tup, headroom) \
+	((Datum *) ((char *) (tup) - (headroom)))
+#define HEAP_SORTKEYCACHE_ISNULLS(tup, headroom, nkeys) \
+	((bool *) ((Datum *) ((char *) (tup) - (headroom)) + (nkeys) - 1))
+
+/*
+ * Extract sort keys 2..nKeys from a MinimalTuple into the key cache that
+ * precedes the tuple in the same allocation.
+ */
+static void
+heap_fill_sortkeycache(TupleDesc tupDesc, SortSupport sortKeys, int nKeys,
+					   MinimalTuple tuple, Size headroom)
+{
+	Datum	   *datums = HEAP_SORTKEYCACHE_DATUMS(tuple, headroom);
+	bool	   *isnulls = HEAP_SORTKEYCACHE_ISNULLS(tuple, headroom, nKeys);
+	HeapTupleData htup;
+	int			key;
+
+	Assert(nKeys > 1);
+	Assert(headroom == heap_sortkeycache_size(nKeys));
+
+	htup.t_len = tuple->t_len + MINIMAL_TUPLE_OFFSET;
+	htup.t_data = (HeapTupleHeader) ((char *) tuple - MINIMAL_TUPLE_OFFSET);
+
+	for (key = 1; key < nKeys; key++)
+		datums[key - 1] = heap_getattr(&htup, sortKeys[key].ssup_attno,
+									   tupDesc, &isnulls[key - 1]);
+}
+
 Tuplesortstate *
 tuplesort_begin_heap(TupleDesc tupDesc,
 					 int nkeys, AttrNumber *attNums,
@@ -244,6 +298,14 @@ tuplesort_begin_heap(TupleDesc tupDesc,
 	 */
 	if (nkeys == 1 && !base->sortKeys->abbrev_converter)
 		base->onlyKey = base->sortKeys;
+
+	/*
+	 * For multi-key sorts, have each stored tuple carry a cache of its
+	 * extracted sort key values, so that tiebreak comparisons need not
+	 * re-extract them from the tuple with heap_getattr().
+	 */
+	if (nkeys > 1)
+		base->tupleheadroom = heap_sortkeycache_size(nkeys);
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -750,13 +812,14 @@ tuplesort_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot)
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
 	TupleDesc	tupDesc = (TupleDesc) base->arg;
+	Size		headroom = base->tupleheadroom;
 	SortTuple	stup;
 	MinimalTuple tuple;
 	HeapTupleData htup;
 	Size		tuplen;
 
-	/* copy the tuple into sort storage */
-	tuple = ExecCopySlotMinimalTuple(slot);
+	/* copy the tuple into sort storage, reserving room for the key cache */
+	tuple = ExecCopySlotMinimalTupleExtra(slot, headroom);
 	stup.tuple = tuple;
 	/* set up first-column key value */
 	htup.t_len = tuple->t_len + MINIMAL_TUPLE_OFFSET;
@@ -766,11 +829,16 @@ tuplesort_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot)
 							   tupDesc,
 							   &stup.isnull1);
 
+	/* cache the remaining sort keys now, to save work during comparisons */
+	if (headroom)
+		heap_fill_sortkeycache(tupDesc, base->sortKeys, base->nKeys,
+							   tuple, headroom);
+
 	/* GetMemoryChunkSpace is not supported for bump contexts */
 	if (TupleSortUseBumpTupleCxt(base->sortopt))
-		tuplen = MAXALIGN(tuple->t_len);
+		tuplen = MAXALIGN(tuple->t_len + headroom);
 	else
-		tuplen = GetMemoryChunkSpace(tuple);
+		tuplen = GetMemoryChunkSpace((char *) tuple - headroom);
 
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys->abbrev_converter &&
@@ -1208,6 +1276,10 @@ removeabbrev_heap(Tuplesortstate *state, SortTuple *stups, int count)
 	int			i;
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 
+	/*
+	 * The per-tuple sort key cache (if used) holds the original key values
+	 * already, so only datum1 needs to be converted here.
+	 */
 	for (i = 0; i < count; i++)
 	{
 		HeapTupleData htup;
@@ -1247,26 +1319,25 @@ comparetup_heap_tiebreak(const SortTuple *a, const SortTuple *b, Tuplesortstate 
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	SortSupport sortKey = base->sortKeys;
-	HeapTupleData ltup;
-	HeapTupleData rtup;
-	TupleDesc	tupDesc;
+	Size		headroom = base->tupleheadroom;
 	int			nkey;
 	int32		compare;
-	AttrNumber	attno;
-	Datum		datum1,
-				datum2;
-	bool		isnull1,
-				isnull2;
-
-	ltup.t_len = ((MinimalTuple) a->tuple)->t_len + MINIMAL_TUPLE_OFFSET;
-	ltup.t_data = (HeapTupleHeader) ((char *) a->tuple - MINIMAL_TUPLE_OFFSET);
-	rtup.t_len = ((MinimalTuple) b->tuple)->t_len + MINIMAL_TUPLE_OFFSET;
-	rtup.t_data = (HeapTupleHeader) ((char *) b->tuple - MINIMAL_TUPLE_OFFSET);
-	tupDesc = (TupleDesc) base->arg;
 
 	if (sortKey->abbrev_converter)
 	{
-		attno = sortKey->ssup_attno;
+		HeapTupleData ltup;
+		HeapTupleData rtup;
+		TupleDesc	tupDesc = (TupleDesc) base->arg;
+		AttrNumber	attno = sortKey->ssup_attno;
+		Datum		datum1,
+					datum2;
+		bool		isnull1,
+					isnull2;
+
+		ltup.t_len = ((MinimalTuple) a->tuple)->t_len + MINIMAL_TUPLE_OFFSET;
+		ltup.t_data = (HeapTupleHeader) ((char *) a->tuple - MINIMAL_TUPLE_OFFSET);
+		rtup.t_len = ((MinimalTuple) b->tuple)->t_len + MINIMAL_TUPLE_OFFSET;
+		rtup.t_data = (HeapTupleHeader) ((char *) b->tuple - MINIMAL_TUPLE_OFFSET);
 
 		datum1 = heap_getattr(&ltup, attno, tupDesc, &isnull1);
 		datum2 = heap_getattr(&rtup, attno, tupDesc, &isnull2);
@@ -1278,19 +1349,29 @@ comparetup_heap_tiebreak(const SortTuple *a, const SortTuple *b, Tuplesortstate 
 			return compare;
 	}
 
-	sortKey++;
-	for (nkey = 1; nkey < base->nKeys; nkey++, sortKey++)
+	if (base->nKeys > 1)
 	{
-		attno = sortKey->ssup_attno;
+		Datum	   *adatums,
+				   *bdatums;
+		bool	   *aisnulls,
+				   *bisnulls;
 
-		datum1 = heap_getattr(&ltup, attno, tupDesc, &isnull1);
-		datum2 = heap_getattr(&rtup, attno, tupDesc, &isnull2);
+		/* Additional sort keys were cached when the tuples were stored */
+		Assert(headroom > 0);
+		adatums = HEAP_SORTKEYCACHE_DATUMS(a->tuple, headroom);
+		aisnulls = HEAP_SORTKEYCACHE_ISNULLS(a->tuple, headroom, base->nKeys);
+		bdatums = HEAP_SORTKEYCACHE_DATUMS(b->tuple, headroom);
+		bisnulls = HEAP_SORTKEYCACHE_ISNULLS(b->tuple, headroom, base->nKeys);
 
-		compare = ApplySortComparator(datum1, isnull1,
-									  datum2, isnull2,
-									  sortKey);
-		if (compare != 0)
-			return compare;
+		sortKey++;
+		for (nkey = 1; nkey < base->nKeys; nkey++, sortKey++)
+		{
+			compare = ApplySortComparator(adatums[nkey - 1], aisnulls[nkey - 1],
+										  bdatums[nkey - 1], bisnulls[nkey - 1],
+										  sortKey);
+			if (compare != 0)
+				return compare;
+		}
 	}
 
 	return 0;
@@ -1321,9 +1402,12 @@ readtup_heap(Tuplesortstate *state, SortTuple *stup,
 {
 	unsigned int tupbodylen = len - sizeof(int);
 	unsigned int tuplen = tupbodylen + MINIMAL_TUPLE_DATA_OFFSET;
-	MinimalTuple tuple = (MinimalTuple) tuplesort_readtup_alloc(state, tuplen);
-	char	   *tupbody = (char *) tuple + MINIMAL_TUPLE_DATA_OFFSET;
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	Size		headroom = base->tupleheadroom;
+	char	   *mem = (char *) tuplesort_readtup_alloc(state,
+													   headroom + tuplen);
+	MinimalTuple tuple = (MinimalTuple) (mem + headroom);
+	char	   *tupbody = (char *) tuple + MINIMAL_TUPLE_DATA_OFFSET;
 	HeapTupleData htup;
 
 	/* read in the tuple proper */
@@ -1339,6 +1423,11 @@ readtup_heap(Tuplesortstate *state, SortTuple *stup,
 								base->sortKeys[0].ssup_attno,
 								(TupleDesc) base->arg,
 								&stup->isnull1);
+
+	/* rebuild the sort key cache */
+	if (headroom)
+		heap_fill_sortkeycache((TupleDesc) base->arg, base->sortKeys,
+							   base->nKeys, tuple, headroom);
 }
 
 /*

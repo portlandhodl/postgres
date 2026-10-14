@@ -388,6 +388,15 @@ struct Sharedsort
 			pfree(buf); \
 	} while(0)
 
+/*
+ * Return the start of the allocation containing the given stored tuple.
+ * Sort variants may reserve per-tuple storage (such as a cache of the
+ * extracted sort key values) immediately preceding the tuple within the
+ * same allocation; see TuplesortPublic.tupleheadroom.
+ */
+#define SORT_TUPLE_ALLOC_BASE(state, tuple) \
+	((void *) ((char *) (tuple) - (state)->base.tupleheadroom))
+
 #define REMOVEABBREV(state,stup,count)	((*(state)->base.removeabbrev) (state, stup, count))
 #define COMPARETUP(state,a,b)	((*(state)->base.comparetup) (a, b, state))
 #define WRITETUP(state,tape,stup)	((*(state)->base.writetup) (state, tape, stup))
@@ -1426,7 +1435,9 @@ tuplesort_gettuple_common(Tuplesortstate *state, bool forward,
 			 */
 			if (state->lastReturnedTuple)
 			{
-				RELEASE_SLAB_SLOT(state, state->lastReturnedTuple);
+				RELEASE_SLAB_SLOT(state,
+								  SORT_TUPLE_ALLOC_BASE(state,
+														state->lastReturnedTuple));
 				state->lastReturnedTuple = NULL;
 			}
 
@@ -1542,7 +1553,9 @@ tuplesort_gettuple_common(Tuplesortstate *state, bool forward,
 			 */
 			if (state->lastReturnedTuple)
 			{
-				RELEASE_SLAB_SLOT(state, state->lastReturnedTuple);
+				RELEASE_SLAB_SLOT(state,
+								  SORT_TUPLE_ALLOC_BASE(state,
+														state->lastReturnedTuple));
 				state->lastReturnedTuple = NULL;
 			}
 
@@ -2121,7 +2134,9 @@ mergeonerun(Tuplesortstate *state)
 
 		/* recycle the slot of the tuple we just wrote out, for the next read */
 		if (state->memtuples[0].tuple)
-			RELEASE_SLAB_SLOT(state, state->memtuples[0].tuple);
+			RELEASE_SLAB_SLOT(state,
+							  SORT_TUPLE_ALLOC_BASE(state,
+													state->memtuples[0].tuple));
 
 		/*
 		 * pull next tuple from the tape, and replace the written-out tuple in
@@ -3428,8 +3443,10 @@ free_sort_tuple(Tuplesortstate *state, SortTuple *stup)
 {
 	if (stup->tuple)
 	{
-		FREEMEM(state, GetMemoryChunkSpace(stup->tuple));
-		pfree(stup->tuple);
+		void	   *alloc = SORT_TUPLE_ALLOC_BASE(state, stup->tuple);
+
+		FREEMEM(state, GetMemoryChunkSpace(alloc));
+		pfree(alloc);
 		stup->tuple = NULL;
 	}
 }

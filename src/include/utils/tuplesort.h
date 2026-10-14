@@ -92,11 +92,14 @@ typedef struct SortCoordinateData *SortCoordinate;
  * tape each heap element/slot belongs to during merging.
  *
  * Storing the first key column lets us save heap_getattr or index_getattr
- * calls during tuple comparisons.  We could extract and save all the key
- * columns not just the first, but this would increase code complexity and
- * overhead, and wouldn't actually save any comparison cycles in the common
- * case where the first key determines the comparison result.  Note that
- * for a pass-by-reference datatype, datum1 points into the "tuple" storage.
+ * calls during tuple comparisons.  For multi-key sorts, extracting the
+ * remaining key columns on every tiebreak comparison would be expensive
+ * enough to dominate the sort when the leading key has many duplicates.
+ * To avoid that, the heap (MinimalTuple) sort variant prepends a cache of
+ * the extracted values of the second and later sort keys to each stored
+ * tuple (see TuplesortPublic.tupleheadroom below); the cache is filled
+ * once per input tuple instead of once per comparison.  Note that for a
+ * pass-by-reference datatype, datum1 points into the "tuple" storage.
  *
  * There is one special case: when the sort support infrastructure provides an
  * "abbreviated key" representation, where the key is (typically) a pass by
@@ -215,6 +218,17 @@ typedef struct
 	int			sortopt;		/* Bitmask of flags used to setup sort */
 
 	bool		tuples;			/* Can SortTuple.tuple ever be set? */
+
+	/*
+	 * When nonzero, each stored tuple of this sort is preceded by this many
+	 * bytes of memory (within the same allocation) holding a cache of the
+	 * extracted values of the second and later sort keys.  Currently only
+	 * the heap (MinimalTuple) sort variant uses this, and only for
+	 * multi-key sorts; all other kinds of sorts leave this as zero.  Code
+	 * that frees the memory containing a stored tuple must subtract this
+	 * from the tuple pointer to obtain the start of the allocation.
+	 */
+	Size		tupleheadroom;
 
 	void	   *arg;			/* Specific information for the sort variant */
 } TuplesortPublic;
