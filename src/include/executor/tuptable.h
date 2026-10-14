@@ -15,6 +15,7 @@
 #define TUPTABLE_H
 
 #include "access/htup.h"
+#include "access/itup.h"
 #include "access/sysattr.h"
 #include "access/tupdesc.h"
 #include "storage/buf.h"
@@ -34,6 +35,15 @@
  * 3. "minimal" physical tuple constructed in palloc'ed memory
  *    (TTSOpsMinimalTuple)
  * 4. "virtual" tuple consisting of Datum/isnull arrays (TTSOpsVirtual)
+ * 5. index tuple returned by an index-only scan
+ *    (TTSOpsIndexOnlyTuple)
+ *
+ * The index-only scan case avoids deforming fetched index tuples until
+ * attributes are actually needed, and only deforms the needed prefix of
+ * attributes.  The index tuple itself remains owned by the index scan
+ * descriptor / AM; like for virtual slots, pass-by-reference Datums
+ * extracted from it must not be used beyond the point where the AM could
+ * have overwritten the tuple.
  *
  *
  * The first two cases are similar in that they both deal with "materialized"
@@ -249,11 +259,13 @@ extern PGDLLIMPORT const TupleTableSlotOps TTSOpsVirtual;
 extern PGDLLIMPORT const TupleTableSlotOps TTSOpsHeapTuple;
 extern PGDLLIMPORT const TupleTableSlotOps TTSOpsMinimalTuple;
 extern PGDLLIMPORT const TupleTableSlotOps TTSOpsBufferHeapTuple;
+extern PGDLLIMPORT const TupleTableSlotOps TTSOpsIndexOnlyTuple;
 
 #define TTS_IS_VIRTUAL(slot) ((slot)->tts_ops == &TTSOpsVirtual)
 #define TTS_IS_HEAPTUPLE(slot) ((slot)->tts_ops == &TTSOpsHeapTuple)
 #define TTS_IS_MINIMALTUPLE(slot) ((slot)->tts_ops == &TTSOpsMinimalTuple)
 #define TTS_IS_BUFFERTUPLE(slot) ((slot)->tts_ops == &TTSOpsBufferHeapTuple)
+#define TTS_IS_INDEXONLYTUPLE(slot) ((slot)->tts_ops == &TTSOpsIndexOnlyTuple)
 
 
 /*
@@ -319,6 +331,41 @@ typedef struct MinimalTupleTableSlot
 	uint32		off;			/* saved state for slot_deform_heap_tuple */
 } MinimalTupleTableSlot;
 
+/* index tuple returned by an index-only scan */
+typedef struct IndexOnlyTupleTableSlot
+{
+	pg_node_attr(abstract)
+
+	TupleTableSlot base;
+
+	/*
+	 * The index tuple as returned by the index AM (via xs_itup), or NULL
+	 * when the slot's contents are solely in the Datum/isnull arrays (e.g.
+	 * after ExecCopySlot).  The pointed-to tuple is owned by the index
+	 * scan and remains valid only until the scan advances; same as for the
+	 * pass-by-reference Datums deformed out of it.
+	 */
+	IndexTuple	tuple;			/* physical tuple */
+	TupleDesc	itupdesc;		/* tuple's descriptor (may differ only in
+								 * storage details from
+								 * base.tts_tupleDescriptor) */
+	uint32		off;			/* saved state for slot_deform_index_tuple */
+
+	/*
+	 * State needed to pad "name" columns stored as cstrings back out to
+	 * NAMEDATALEN bytes as they are deformed.  The three fields are
+	 * borrowed from the index scan descriptor at tuple store time and live
+	 * as long as the scan.  next_name_cstring is the index of the next such
+	 * column whose deformed value has not been padded yet.
+	 */
+	const AttrNumber *name_cstring_attnums; /* index column numbers */
+	char	   *name_cstring_buf; /* one NAMEDATALEN slot per such column */
+	int			name_cstring_count;
+	int			next_name_cstring;
+
+	char	   *data;			/* data for materialized slots */
+} IndexOnlyTupleTableSlot;
+
 /*
  * TupIsNull -- is a TupleTableSlot empty?
  */
@@ -354,6 +401,9 @@ extern TupleTableSlot *ExecStoreMinimalTuple(MinimalTuple mtup,
 											 bool shouldFree);
 extern void ExecForceStoreMinimalTuple(MinimalTuple mtup, TupleTableSlot *slot,
 									   bool shouldFree);
+struct IndexScanDescData;
+extern TupleTableSlot *ExecStoreIndexOnlyTuple(TupleTableSlot *slot,
+											   struct IndexScanDescData *scan);
 extern TupleTableSlot *ExecStoreVirtualTuple(TupleTableSlot *slot);
 extern TupleTableSlot *ExecStoreAllNullTuple(TupleTableSlot *slot);
 extern void ExecStoreHeapTupleDatum(Datum data, TupleTableSlot *slot);

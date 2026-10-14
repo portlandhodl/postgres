@@ -57,8 +57,10 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
+#include "access/relscan.h"
 #include "access/tupdesc_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
@@ -74,6 +76,9 @@ static TupleDesc ExecTypeFromTLInternal(List *targetList,
 										bool skipjunk);
 static pg_always_inline void slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
 													int reqnatts, bool support_cstring);
+static void slot_deform_index_tuple(TupleTableSlot *slot, IndexTuple tuple,
+									TupleDesc itupdesc, uint32 *offp,
+									int reqnatts);
 static inline void tts_buffer_heap_store_tuple(TupleTableSlot *slot,
 											   HeapTuple tuple,
 											   Buffer buffer,
@@ -85,6 +90,7 @@ const TupleTableSlotOps TTSOpsVirtual;
 const TupleTableSlotOps TTSOpsHeapTuple;
 const TupleTableSlotOps TTSOpsMinimalTuple;
 const TupleTableSlotOps TTSOpsBufferHeapTuple;
+const TupleTableSlotOps TTSOpsIndexOnlyTuple;
 
 
 /*
@@ -166,23 +172,26 @@ tts_virtual_is_current_xact_tuple(TupleTableSlot *slot)
 }
 
 /*
- * To materialize a virtual slot all the datums that aren't passed by value
- * have to be copied into the slot's memory context.  To do so, compute the
- * required size, and allocate enough memory to store all attributes.  That's
- * good for cache hit ratio, but more importantly requires only memory
- * allocation/deallocation.
+ * Helper for materializing slots that hold their contents in the
+ * Datum/isnull arrays (i.e. virtual and index-only slots).
+ *
+ * All the datums that aren't passed by value have to be copied into the
+ * slot's memory context.  To do so, compute the required size, and allocate
+ * enough memory to store all attributes.  That's good for cache hit ratio,
+ * but more importantly requires only memory allocation/deallocation.
+ *
+ * Returns the allocated data block, which the caller should arrange to
+ * release when the slot is cleared, or NULL if all attributes are by-value
+ * or null (in which case no private storage is needed).  The slot must have
+ * all its attributes deformed already.
  */
-static void
-tts_virtual_materialize(TupleTableSlot *slot)
+static char *
+slot_materialize_datums(TupleTableSlot *slot)
 {
-	VirtualTupleTableSlot *vslot = (VirtualTupleTableSlot *) slot;
 	TupleDesc	desc = slot->tts_tupleDescriptor;
 	Size		sz = 0;
 	char	   *data;
-
-	/* already materialized */
-	if (TTS_SHOULDFREE(slot))
-		return;
+	char	   *data_start;
 
 	/* compute size of memory required */
 	for (int natt = 0; natt < desc->natts; natt++)
@@ -214,11 +223,10 @@ tts_virtual_materialize(TupleTableSlot *slot)
 
 	/* all data is byval */
 	if (sz == 0)
-		return;
+		return NULL;
 
 	/* allocate memory */
-	vslot->data = data = MemoryContextAlloc(slot->tts_mcxt, sz);
-	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+	data = data_start = MemoryContextAlloc(slot->tts_mcxt, sz);
 
 	/* and copy all attributes into the pre-allocated space */
 	for (int natt = 0; natt < desc->natts; natt++)
@@ -263,6 +271,26 @@ tts_virtual_materialize(TupleTableSlot *slot)
 			data += data_length;
 		}
 	}
+
+	return data_start;
+}
+
+/*
+ * To materialize a virtual slot all the datums that aren't passed by value
+ * have to be copied into the slot's memory context.
+ */
+static void
+tts_virtual_materialize(TupleTableSlot *slot)
+{
+	VirtualTupleTableSlot *vslot = (VirtualTupleTableSlot *) slot;
+
+	/* already materialized */
+	if (TTS_SHOULDFREE(slot))
+		return;
+
+	vslot->data = slot_materialize_datums(slot);
+	if (vslot->data != NULL)
+		slot->tts_flags |= TTS_FLAG_SHOULDFREE;
 }
 
 static void
@@ -700,6 +728,204 @@ tts_minimal_store_tuple(TupleTableSlot *slot, MinimalTuple mtup, bool shouldFree
 
 	if (shouldFree)
 		slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+}
+
+
+/*
+ * TupleTableSlotOps implementation for IndexOnlyTupleTableSlot.
+ */
+
+static void
+tts_indexonly_init(TupleTableSlot *slot)
+{
+}
+
+static void
+tts_indexonly_release(TupleTableSlot *slot)
+{
+}
+
+static void
+tts_indexonly_clear(TupleTableSlot *slot)
+{
+	IndexOnlyTupleTableSlot *ioslot = (IndexOnlyTupleTableSlot *) slot;
+
+	/* Free the memory for the materialized datums, if any. */
+	if (unlikely(TTS_SHOULDFREE(slot)))
+	{
+		pfree(ioslot->data);
+		ioslot->data = NULL;
+		slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+	}
+
+	/*
+	 * Just forget the index tuple; it is owned by the index scan, whose
+	 * lifetime bounds the slot's non-empty state, and clearing must not
+	 * dereference it.
+	 */
+	slot->tts_nvalid = 0;
+	slot->tts_flags |= TTS_FLAG_EMPTY;
+	ItemPointerSetInvalid(&slot->tts_tid);
+	ioslot->tuple = NULL;
+	ioslot->itupdesc = NULL;
+	ioslot->off = 0;
+	ioslot->name_cstring_attnums = NULL;
+	ioslot->name_cstring_buf = NULL;
+	ioslot->name_cstring_count = 0;
+	ioslot->next_name_cstring = 0;
+}
+
+static void
+tts_indexonly_getsomeattrs(TupleTableSlot *slot, int natts)
+{
+	IndexOnlyTupleTableSlot *ioslot = (IndexOnlyTupleTableSlot *) slot;
+
+	Assert(!TTS_EMPTY(slot));
+
+	/* Should never get called for a slot only containing Datum/isnull data */
+	Assert(ioslot->tuple != NULL);
+
+	slot_deform_index_tuple(slot, ioslot->tuple, ioslot->itupdesc,
+							&ioslot->off, natts);
+
+	/*
+	 * Copy any "name" columns stored as cstrings among the just-deformed
+	 * attributes back into NAMEDATALEN bytes of name_cstring_buf.
+	 * next_name_cstring keeps this a no-op scan over columns dealt with by
+	 * earlier calls.
+	 */
+	if (unlikely(ioslot->name_cstring_attnums != NULL))
+	{
+		int			attnum;
+
+		while (ioslot->next_name_cstring < ioslot->name_cstring_count &&
+			   (attnum =
+				ioslot->name_cstring_attnums[ioslot->next_name_cstring]) < natts)
+		{
+			/* skip null Datums */
+			if (!slot->tts_isnull[attnum])
+			{
+				Name		name;
+
+				/* use namestrcpy to zero-pad all trailing bytes */
+				name = (Name) (ioslot->name_cstring_buf +
+							   ioslot->next_name_cstring * NAMEDATALEN);
+				namestrcpy(name, DatumGetCString(slot->tts_values[attnum]));
+				slot->tts_values[attnum] = NameGetDatum(name);
+			}
+
+			ioslot->next_name_cstring++;
+		}
+	}
+}
+
+/*
+ * IndexOnlyTupleTableSlots never provide system attributes (except those
+ * handled generically, such as tableoid).  We generally shouldn't get
+ * here, but provide a user-friendly message if we do.
+ */
+static Datum
+tts_indexonly_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
+{
+	Assert(!TTS_EMPTY(slot));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot retrieve a system column in this context")));
+
+	return 0;					/* silence compiler warnings */
+}
+
+/*
+ * IndexOnlyTupleTableSlot never has transaction information.  We generally
+ * shouldn't get here, but provide a user-friendly message if we do.
+ */
+static bool
+tts_indexonly_is_current_xact_tuple(TupleTableSlot *slot)
+{
+	Assert(!TTS_EMPTY(slot));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("don't have transaction information for this type of tuple")));
+
+	return false;				/* silence compiler warnings */
+}
+
+/*
+ * Copied into the slot's memory from deformed values, as for a virtual
+ * slot.  Afterwards the slot's contents no longer depend on the index
+ * tuple.
+ */
+static void
+tts_indexonly_materialize(TupleTableSlot *slot)
+{
+	IndexOnlyTupleTableSlot *ioslot = (IndexOnlyTupleTableSlot *) slot;
+
+	Assert(!TTS_EMPTY(slot));
+
+	/* If slot has its tuple already materialized, nothing to do. */
+	if (TTS_SHOULDFREE(slot))
+		return;
+
+	/* Deform all the remaining attributes */
+	if (ioslot->tuple != NULL)
+		slot_getallattrs(slot);
+
+	/* The extracted datums no longer need the index tuple */
+	ioslot->tuple = NULL;
+	ioslot->off = 0;
+
+	ioslot->data = slot_materialize_datums(slot);
+	if (ioslot->data != NULL)
+		slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+}
+
+static void
+tts_indexonly_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
+{
+	TupleDesc	srcdesc = srcslot->tts_tupleDescriptor;
+
+	tts_indexonly_clear(dstslot);
+
+	slot_getallattrs(srcslot);
+
+	for (int natt = 0; natt < srcdesc->natts; natt++)
+	{
+		dstslot->tts_values[natt] = srcslot->tts_values[natt];
+		dstslot->tts_isnull[natt] = srcslot->tts_isnull[natt];
+	}
+
+	dstslot->tts_nvalid = srcdesc->natts;
+	dstslot->tts_flags &= ~TTS_FLAG_EMPTY;
+
+	/* make sure storage doesn't depend on external memory */
+	tts_indexonly_materialize(dstslot);
+}
+
+static HeapTuple
+tts_indexonly_copy_heap_tuple(TupleTableSlot *slot)
+{
+	Assert(!TTS_EMPTY(slot));
+
+	slot_getallattrs(slot);
+
+	return heap_form_tuple(slot->tts_tupleDescriptor,
+						   slot->tts_values,
+						   slot->tts_isnull);
+}
+
+static MinimalTuple
+tts_indexonly_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+{
+	Assert(!TTS_EMPTY(slot));
+
+	slot_getallattrs(slot);
+
+	return heap_form_minimal_tuple(slot->tts_tupleDescriptor,
+								   slot->tts_values,
+								   slot->tts_isnull,
+								   extra);
 }
 
 
@@ -1273,6 +1499,175 @@ done:
 	*offp = off;
 }
 
+/*
+ * slot_deform_index_tuple
+ *		Given a tuple table slot containing an index tuple returned by an
+ *		index-only scan, extract data from the tuple into its Datum/isnull
+ *		arrays.  Data is extracted up through the reqnatts'th column.  An
+ *		error is raised if reqnatts is above the number of attributes in the
+ *		tuple descriptor.
+ *
+ *		This is essentially an incremental version of index_deform_tuple:
+ *		on each call we extract attributes up to the one needed, without
+ *		re-computing information about previously extracted attributes.
+ *		slot->tts_nvalid is the number of attributes already extracted.
+ *
+ * 'itupdesc' is the tuple descriptor matching the index tuple's layout,
+ * which can differ from the slot's descriptor in storage details such as
+ * alignment of individual columns; the datums extracted are binary
+ * compatible with the slot's descriptor.  Unlike slot_deform_heap_tuple
+ * there's no need to deal with attributes missing from the tuple, as an
+ * index tuple always stores all of its columns.
+ */
+static void
+slot_deform_index_tuple(TupleTableSlot *slot, IndexTuple tuple,
+						TupleDesc itupdesc, uint32 *offp, int reqnatts)
+{
+	CompactAttribute *cattrs;
+	CompactAttribute *cattr;
+	size_t		attnum;
+	int			firstNonCacheOffsetAttr;
+	int			firstNullAttr;
+	Datum	   *values;
+	bool	   *isnull;
+	char	   *tp;				/* ptr to tuple data */
+	uint32		off;			/* offset in tuple data */
+
+	if (unlikely(reqnatts > itupdesc->natts))
+		elog(ERROR, "attribute number %d exceeds number of columns %d",
+			 reqnatts, itupdesc->natts);
+
+	/* Did someone forget to call TupleDescFinalize()? */
+	Assert(itupdesc->firstNonCachedOffsetAttr >= 0);
+
+	isnull = slot->tts_isnull;
+	values = slot->tts_values;
+
+	if (IndexTupleHasNulls(tuple))
+	{
+		uint8	   *bp;			/* ptr to null bitmap in tuple */
+
+		/* XXX "knows" t_bits are just after fixed tuple header! */
+		bp = (uint8 *) ((char *) tuple + sizeof(IndexTupleData));
+
+		/* Find the first NULL attr */
+		firstNullAttr = first_null_attr(bp, reqnatts);
+
+		/*
+		 * And populate the isnull array for all attributes being fetched
+		 * from the tuple.
+		 */
+		populate_isnull_array(bp, reqnatts, isnull);
+	}
+	else
+	{
+		/* All attrs can be fetched without checking for NULLs */
+		firstNullAttr = reqnatts;
+	}
+
+	attnum = slot->tts_nvalid;
+	slot->tts_nvalid = reqnatts;
+
+	/*
+	 * We store the tupleDesc's CompactAttribute array in 'cattrs' as gcc
+	 * seems to be unwilling to optimize accessing the CompactAttribute
+	 * element efficiently when accessing it via TupleDescCompactAttr().
+	 */
+	cattrs = itupdesc->compact_attrs;
+
+	tp = (char *) tuple + IndexInfoFindDataOffset(tuple->t_info);
+
+	/* We can use attcacheoff up until the first NULL */
+	firstNonCacheOffsetAttr = Min(itupdesc->firstNonCachedOffsetAttr,
+								  firstNullAttr);
+
+	/*
+	 * Handle the portion of the tuple that we have cached the offset for up
+	 * to the first NULL attribute.  The offset is effectively fixed for
+	 * these, so we can use the CompactAttribute's attcacheoff.
+	 */
+	if (attnum < firstNonCacheOffsetAttr)
+	{
+		int			attlen;
+
+		do
+		{
+			isnull[attnum] = false;
+			cattr = &cattrs[attnum];
+			attlen = cattr->attlen;
+			off = cattr->attcacheoff;
+			values[attnum] = fetch_att_noerr(tp + off,
+											 cattr->attbyval,
+											 attlen);
+			attnum++;
+		} while (attnum < firstNonCacheOffsetAttr);
+
+		/*
+		 * Point the offset after the end of the last attribute with a
+		 * cached offset.  We expect the final cached offset attribute to
+		 * have a fixed width, so just add the attlen to the attcacheoff.
+		 */
+		Assert(attlen > 0);
+		off += attlen;
+	}
+	else
+	{
+		/*
+		 * We may be incrementally deforming the tuple, so set 'off' to the
+		 * previously cached value.  This may be 0, if the slot has just
+		 * received a new tuple.
+		 */
+		off = *offp;
+
+		/* We expect *offp to be set to 0 when attnum == 0 */
+		Assert(off == 0 || attnum > 0);
+	}
+
+	/*
+	 * Handle any portion of the tuple that doesn't have a fixed offset up
+	 * until the first NULL attribute.  This loop only differs from the one
+	 * after it by the NULL checks.
+	 */
+	for (; attnum < firstNullAttr; attnum++)
+	{
+		isnull[attnum] = false;
+		cattr = &cattrs[attnum];
+
+		/* align 'off', fetch the datum, and increment off beyond the datum */
+		values[attnum] = align_fetch_then_add(tp,
+											  &off,
+											  cattr->attbyval,
+											  cattr->attlen,
+											  cattr->attalignby);
+	}
+
+	/*
+	 * Now handle any remaining attributes in the tuple up to the requested
+	 * attnum.  This time, include NULL checks as we're now at the first
+	 * NULL attribute.
+	 */
+	for (; attnum < reqnatts; attnum++)
+	{
+		if (isnull[attnum])
+		{
+			values[attnum] = (Datum) 0;
+			continue;
+		}
+
+		cattr = &cattrs[attnum];
+
+		/* align 'off', fetch the datum, and increment off beyond the datum */
+		values[attnum] = align_fetch_then_add(tp,
+											  &off,
+											  cattr->attbyval,
+											  cattr->attlen,
+											  cattr->attalignby);
+	}
+
+	/* Save current offset for next execution */
+	*offp = off;
+}
+
 const TupleTableSlotOps TTSOpsVirtual = {
 	.base_slot_size = sizeof(VirtualTupleTableSlot),
 	.init = tts_virtual_init,
@@ -1346,6 +1741,27 @@ const TupleTableSlotOps TTSOpsBufferHeapTuple = {
 	.get_minimal_tuple = NULL,
 	.copy_heap_tuple = tts_buffer_heap_copy_heap_tuple,
 	.copy_minimal_tuple = tts_buffer_heap_copy_minimal_tuple
+};
+
+const TupleTableSlotOps TTSOpsIndexOnlyTuple = {
+	.base_slot_size = sizeof(IndexOnlyTupleTableSlot),
+	.init = tts_indexonly_init,
+	.release = tts_indexonly_release,
+	.clear = tts_indexonly_clear,
+	.getsomeattrs = tts_indexonly_getsomeattrs,
+	.getsysattr = tts_indexonly_getsysattr,
+	.is_current_xact_tuple = tts_indexonly_is_current_xact_tuple,
+	.materialize = tts_indexonly_materialize,
+	.copyslot = tts_indexonly_copyslot,
+
+	/*
+	 * An index-only tuple table slot can not "own" a heap tuple or a
+	 * minimal tuple.
+	 */
+	.get_heap_tuple = NULL,
+	.get_minimal_tuple = NULL,
+	.copy_heap_tuple = tts_indexonly_copy_heap_tuple,
+	.copy_minimal_tuple = tts_indexonly_copy_minimal_tuple
 };
 
 
@@ -1817,6 +2233,55 @@ ExecForceStoreMinimalTuple(MinimalTuple mtup,
 			pfree(mtup);
 		}
 	}
+}
+
+/* --------------------------------
+ *		ExecStoreIndexOnlyTuple
+ *			Store the tuple data returned by an index-only scan (scan's
+ *			xs_itup/xs_itupdesc) into a slot, without deforming it.
+ *
+ * This is the counterpart of storing a physical tuple in other physical
+ * slot types: attributes are deformed lazily, only when they are actually
+ * requested via slot_getsomeattrs.  The tuple must remain valid until the
+ * slot is cleared (it's typically AM-owned memory, valid until the scan
+ * advances -- the same guarantee the old index-only scan code relied on
+ * for the Datums deformed out of it).
+ * --------------------------------
+ */
+TupleTableSlot *
+ExecStoreIndexOnlyTuple(TupleTableSlot *slot, IndexScanDesc scan)
+{
+	IndexOnlyTupleTableSlot *ioslot = (IndexOnlyTupleTableSlot *) slot;
+	IndexTuple	tuple = scan->xs_itup;
+	TupleDesc	itupdesc = scan->xs_itupdesc;
+
+	/* sanity checks */
+	Assert(slot != NULL);
+	Assert(slot->tts_tupleDescriptor != NULL);
+	Assert(TTS_EMPTY(slot));
+	Assert(tuple != NULL);
+	Assert(itupdesc != NULL);
+
+	if (unlikely(!TTS_IS_INDEXONLYTUPLE(slot)))
+		elog(ERROR, "trying to store an index-only tuple into wrong type of slot");
+
+	/* The tuple must contain all the attributes the slot's descriptor has */
+	Assert(slot->tts_tupleDescriptor->natts == itupdesc->natts);
+
+	slot->tts_nvalid = 0;
+	ioslot->tuple = tuple;
+	ioslot->itupdesc = itupdesc;
+	ioslot->off = 0;
+
+	/* remember where to pad out "name" columns stored as cstrings */
+	ioslot->name_cstring_attnums = scan->xs_name_cstring_attnums;
+	ioslot->name_cstring_buf = scan->xs_name_cstring_buf;
+	ioslot->name_cstring_count = scan->xs_name_cstring_count;
+	ioslot->next_name_cstring = 0;
+
+	slot->tts_flags &= ~TTS_FLAG_EMPTY;
+
+	return slot;
 }
 
 /* --------------------------------

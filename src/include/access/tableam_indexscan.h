@@ -85,10 +85,23 @@ tableam_index_fill_ios_slot(IndexScanDesc scan, TupleTableSlot *slot)
 
 		heap_deform_tuple(scan->xs_hitup, scan->xs_hitupdesc,
 						  slot->tts_values, slot->tts_isnull);
+
+		ExecStoreVirtualTuple(slot);
 	}
 	else if (scan->xs_itup)
 	{
 		Assert(slot->tts_tupleDescriptor->natts == scan->xs_itupdesc->natts);
+
+		/*
+		 * The dedicated index-only scan slot type just remembers the index
+		 * tuple and deforms it lazily; it also takes care of re-padding
+		 * "name" columns as their values are deformed.
+		 */
+		if (TTS_IS_INDEXONLYTUPLE(slot))
+		{
+			ExecStoreIndexOnlyTuple(slot, scan);
+			return;
+		}
 
 		index_deform_tuple(scan->xs_itup, scan->xs_itupdesc,
 						   slot->tts_values, slot->tts_isnull);
@@ -102,11 +115,11 @@ tableam_index_fill_ios_slot(IndexScanDesc scan, TupleTableSlot *slot)
 		 */
 		if (unlikely(scan->xs_name_cstring_attnums != NULL))
 			tableam_index_fill_ios_names(scan, slot);
+
+		ExecStoreVirtualTuple(slot);
 	}
 	else
 		elog(ERROR, "no data returned for index-only scan");
-
-	ExecStoreVirtualTuple(slot);
 }
 
 #endif							/* TABLEAM_INDEXSCAN_H */

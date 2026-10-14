@@ -466,9 +466,13 @@ typedef struct TableAmRoutine
 	 * scans, each with fewer branches).
 	 *
 	 * Plain index scans use whatever slot type the table AM's slot_callbacks
-	 * chooses.  Index-only scans always use a virtual slot, which is filled
-	 * using index data in a standardized way (though determining which index
-	 * tuples satisfy scan->xs_snapshot is still up to the table AM).
+	 * chooses.  Index-only scans use the dedicated index-only slot type
+	 * (TTSOpsIndexOnlyTuple) or, for misc callers outside the executor
+	 * (e.g. get_actual_variable_endpoint()), a virtual slot.  Either way the
+	 * slot is filled using index data in a standardized way (though
+	 * determining which index tuples satisfy scan->xs_snapshot is still up
+	 * to the table AM); the index-only slot type just defers most of the
+	 * deforming work until the contained attributes are actually needed.
 	 *
 	 * The xs_getnext_slot callback is also responsible for whatever
 	 * bookkeeping its callers expect of an index scan, such as maintaining
@@ -1304,7 +1308,8 @@ table_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 						 TupleTableSlot *slot)
 {
 	/* See index_scan_begin for an explanation of index-only scan slot type */
-	Assert(!scan->xs_want_itup || TTS_IS_VIRTUAL(slot));
+	Assert(!scan->xs_want_itup || TTS_IS_INDEXONLYTUPLE(slot) ||
+		   TTS_IS_VIRTUAL(slot));
 	Assert(scan->xs_table_opaque);
 
 	return scan->xs_getnext_slot(scan, direction, slot);

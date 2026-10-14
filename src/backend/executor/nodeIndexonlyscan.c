@@ -392,10 +392,15 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	 * types of the original datums.  (It's the index AM's responsibility to
 	 * return suitable data anyway.  The table AM fills our slot with that
 	 * returned data.)
+	 *
+	 * The scan slot is a TTSOpsIndexOnlyTuple slot, so that the index
+	 * tuples returned by the AM are deformed lazily (only as far as and
+	 * when the attributes are actually needed) rather than eagerly at
+	 * fetch time.
 	 */
 	tupDesc = ExecTypeFromTL(node->indextlist);
 	ExecInitScanTupleSlot(estate, &indexstate->ss, tupDesc,
-						  &TTSOpsVirtual,
+						  &TTSOpsIndexOnlyTuple,
 						  0);
 
 	/*
